@@ -4,6 +4,7 @@ const { promises: fs } = require('fs');
 const path = require('path');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
+const xsenv = require('@sap/xsenv');
 
 const MAX_FILE_SIZE = Number(process.env.DOCUMENT_MAX_SIZE || 10 * 1024 * 1024);
 const ALLOWED_MIME_TYPES = (process.env.ALLOWED_MIME_TYPES || 'application/pdf')
@@ -15,6 +16,15 @@ const GENAI_API_URL = process.env.GENAI_API_URL;
 const GENAI_API_KEY = process.env.GENAI_API_KEY;
 const GENAI_MODEL = process.env.GENAI_MODEL || 'gpt-4o-mini';
 const FEEDBACK_CONFIDENCE_THRESHOLD = Number(process.env.FEEDBACK_CONFIDENCE_THRESHOLD || 0.8);
+const BPA_DESTINATION_NAME = process.env.BPA_DESTINATION_NAME || 'sap-bpa';
+const BPA_TRIGGER_PATH = process.env.BPA_TRIGGER_PATH || '/workflow/rest/v1/workflow-instances';
+const ROUTING_AMOUNT_THRESHOLD = Number(process.env.ROUTING_AMOUNT_THRESHOLD || 10000);
+const ROUTING_HIGH_RISK_LEVELS = (process.env.ROUTING_HIGH_RISK_LEVELS || 'high,critical')
+  .split(',')
+  .map((risk) => risk.trim().toLowerCase())
+  .filter(Boolean);
+
+xsenv.loadEnv();
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -193,6 +203,231 @@ function parseAnalysisResult(genAiResult) {
   };
 }
 
+function evaluateRoutingRules(analysis) {
+  const amount = normalizeNumber(analysis.amount);
+  const riskLevel = (analysis.riskLevel || '').toString().toLowerCase();
+
+  const amountExceedsThreshold = Number.isFinite(amount) && amount > ROUTING_AMOUNT_THRESHOLD;
+  const highRisk = Boolean(riskLevel) && ROUTING_HIGH_RISK_LEVELS.includes(riskLevel);
+
+  const requiresApproval = amountExceedsThreshold || highRisk;
+  const reasons = [];
+  if (amountExceedsThreshold) {
+    reasons.push(`Amount ${amount} is greater than ${ROUTING_AMOUNT_THRESHOLD}`);
+  }
+  if (highRisk) {
+    reasons.push(`Risk level ${analysis.riskLevel} requires review`);
+  }
+
+  return {
+    decision: requiresApproval ? 'REQUIRES_REVIEW' : 'AUTO_APPROVE',
+    requiresApproval,
+    amountExceedsThreshold,
+    highRisk,
+    reason: reasons.join(' and ') || 'Within automatic approval thresholds',
+    amount,
+    riskLevel: analysis.riskLevel,
+  };
+}
+
+function buildBpaPayload(document, analysis, routingDecision) {
+  return {
+    documentId: document.ID,
+    analysisId: analysis.ID,
+    amount: analysis.amount,
+    riskLevel: analysis.riskLevel,
+    vendor: analysis.vendor,
+    invoiceDate: analysis.date,
+    documentTitle: document.title,
+    description: document.description,
+    fileName: document.fileName,
+    requiresApproval: routingDecision.requiresApproval,
+    routingDecision: routingDecision.decision,
+    routingReason: routingDecision.reason,
+    thresholdAmount: ROUTING_AMOUNT_THRESHOLD,
+    riskPolicy: ROUTING_HIGH_RISK_LEVELS,
+  };
+}
+
+function getDestinationService() {
+  try {
+    const services = xsenv.getServices({ destination: { tag: 'destination' } });
+    return services.destination;
+  } catch (error) {
+    const err = new Error('Destination service binding not found');
+    err.statusCode = 500;
+    throw err;
+  }
+}
+
+async function fetchServiceToken(serviceCreds) {
+  const auth = Buffer.from(`${serviceCreds.clientid}:${serviceCreds.clientsecret}`).toString('base64');
+  const body = new URLSearchParams();
+  body.append('grant_type', 'client_credentials');
+
+  const response = await fetch(`${serviceCreds.url}/oauth/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    const error = new Error('Failed to obtain Destination service token');
+    error.statusCode = response.status;
+    throw error;
+  }
+
+  const payload = await response.json();
+  return payload.access_token;
+}
+
+async function loadDestinationConfig(destinationName) {
+  const destinationService = getDestinationService();
+  const serviceToken = await fetchServiceToken(destinationService);
+
+  const response = await fetch(
+    `${destinationService.uri}/destination-configuration/v1/destinations/${destinationName}`,
+    {
+      headers: {
+        Authorization: `Bearer ${serviceToken}`,
+      },
+    }
+  );
+
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch (err) {
+    payload = { raw: text };
+  }
+
+  if (!response.ok) {
+    const error = new Error(payload.error || `Failed to load destination ${destinationName}`);
+    error.statusCode = response.status;
+    error.details = payload;
+    throw error;
+  }
+
+  if (!payload.destinationConfiguration) {
+    const error = new Error(`Destination ${destinationName} is missing configuration`);
+    error.statusCode = 500;
+    throw error;
+  }
+
+  return payload.destinationConfiguration;
+}
+
+function resolveDestinationTokenConfig(destinationConfig) {
+  const clientId = destinationConfig.clientId || destinationConfig.ClientId || destinationConfig.clientid;
+  const clientSecret =
+    destinationConfig.clientSecret || destinationConfig.ClientSecret || destinationConfig.clientsecret;
+  const tokenServiceURL =
+    destinationConfig.tokenServiceURL || destinationConfig.TokenServiceURL || destinationConfig.tokenServiceUrl;
+
+  return { clientId, clientSecret, tokenServiceURL };
+}
+
+async function fetchBpaAccessToken(destinationConfig) {
+  const { clientId, clientSecret, tokenServiceURL } = resolveDestinationTokenConfig(destinationConfig);
+
+  if (!clientId || !clientSecret || !tokenServiceURL) {
+    const error = new Error('Destination is missing OAuth client configuration');
+    error.statusCode = 500;
+    throw error;
+  }
+
+  const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const body = new URLSearchParams();
+  body.append('grant_type', 'client_credentials');
+  body.append('client_id', clientId);
+
+  const response = await fetch(tokenServiceURL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body,
+  });
+
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch (err) {
+    payload = { raw: text };
+  }
+
+  if (!response.ok) {
+    const error = new Error(payload.error || 'Failed to obtain BPA access token');
+    error.statusCode = response.status;
+    error.details = payload;
+    throw error;
+  }
+
+  return payload.access_token;
+}
+
+async function triggerBpaWorkflow(payload) {
+  const destinationConfig = await loadDestinationConfig(BPA_DESTINATION_NAME);
+  const bpaToken = await fetchBpaAccessToken(destinationConfig);
+
+  const baseUrl = destinationConfig.URL || destinationConfig.url;
+  if (!baseUrl) {
+    const error = new Error('Destination URL is not configured for BPA trigger');
+    error.statusCode = 500;
+    throw error;
+  }
+
+  const normalizedBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+  const normalizedPath = BPA_TRIGGER_PATH.startsWith('/') ? BPA_TRIGGER_PATH : `/${BPA_TRIGGER_PATH}`;
+  const targetUrl = `${normalizedBase}${normalizedPath}`;
+
+  const response = await fetch(targetUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${bpaToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await response.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch (err) {
+    body = { raw: text };
+  }
+
+  if (!response.ok) {
+    const error = new Error(body.error || 'Failed to trigger BPA workflow');
+    error.statusCode = response.status;
+    error.details = body;
+    throw error;
+  }
+
+  const instanceId = body.id || body.workflowInstanceId || body.workflowId || body.instanceId;
+  const status = body.status || body.state || 'TRIGGERED';
+
+  return { instanceId, status, rawResponse: body };
+}
+
+async function getAnalysisForDocument(documentId, analysisId) {
+  if (analysisId) {
+    return SELECT.one.from('ai.doc.DocumentAnalyses').where({ ID: analysisId, document_ID: documentId });
+  }
+
+  return SELECT.one
+    .from('ai.doc.DocumentAnalyses')
+    .where({ document_ID: documentId })
+    .orderBy('createdAt desc');
+}
+
 module.exports = cds.service.impl(function () {
   const { Documents, DocumentAnalyses, DocumentFeedback } = this.entities;
   const app = cds.app;
@@ -338,6 +573,48 @@ module.exports = cds.service.impl(function () {
     } catch (error) {
       const status = error.statusCode || 500;
       res.status(status).json({ error: error.message || 'Failed to store feedback' });
+    }
+  });
+
+  app.post('/documents/:id/route', async (req, res) => {
+    const documentId = req.params.id;
+    const { analysisId } = req.body || {};
+
+    try {
+      const document = await SELECT.one.from(Documents).where({ ID: documentId });
+      if (!document) {
+        return res.status(404).json({ error: 'Document not found' });
+      }
+
+      const analysisRecord = await getAnalysisForDocument(documentId, analysisId);
+      if (!analysisRecord) {
+        return res.status(404).json({ error: 'No analysis found for this document' });
+      }
+
+      const routingDecision = evaluateRoutingRules(analysisRecord);
+      const workflowPayload = buildBpaPayload(document, analysisRecord, routingDecision);
+      const workflowResult = await triggerBpaWorkflow(workflowPayload);
+
+      const tx = cds.tx(req);
+      await tx.run(
+        UPDATE(DocumentAnalyses, analysisRecord.ID).with({
+          workflowInstanceId: workflowResult.instanceId,
+          workflowStatus: workflowResult.status,
+        })
+      );
+      await tx.run(UPDATE(Documents, documentId).with({ status: 'ROUTED' }));
+
+      res.json({
+        documentId,
+        analysisId: analysisRecord.ID,
+        workflowInstanceId: workflowResult.instanceId,
+        workflowStatus: workflowResult.status,
+        routingDecision,
+        workflowResponse: workflowResult.rawResponse,
+      });
+    } catch (error) {
+      const status = error.statusCode || 500;
+      res.status(status).json({ error: error.message || 'Failed to route document' });
     }
   });
 });
