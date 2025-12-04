@@ -7,7 +7,9 @@
     "@sap/xsenv": "^4",
     "@sap/xssec": "^4",
     "express": "^4",
-    "passport": "^0.7"
+    "multer": "^1.4.5-lts.1",
+    "passport": "^0.7",
+    "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
     "@cap-js/sqlite": "^2"
