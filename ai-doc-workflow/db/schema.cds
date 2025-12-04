@@ -12,3 +12,23 @@ entity Documents : cuid, managed {
   extractedText : LargeString;
   status      : String(30) default 'NEW';
 }
+
+entity DocumentAnalyses : cuid, managed {
+  document         : Association to Documents;
+  prompt           : LargeString;
+  response         : LargeString;
+  amount           : Decimal(15, 2);
+  vendor           : String(255);
+  date             : Date;
+  riskLevel        : String(30);
+  confidence       : Decimal(5, 2);
+  feedbackRequired : Boolean default false;
+  feedbackProvided : Boolean default false;
+}
+
+entity DocumentFeedback : cuid, managed {
+  analysis   : Association to DocumentAnalyses;
+  corrections: LargeString;
+  comments   : String;
+  submittedBy: String;
+}

@@ -6,4 +6,6 @@ service DocumentService {
     { grant: ['READ', 'CREATE', 'UPDATE', 'DELETE'], to: 'Uploader' }
   ]
   entity Documents as projection on doc.Documents;
+  entity DocumentAnalyses as projection on doc.DocumentAnalyses;
+  entity DocumentFeedback as projection on doc.DocumentFeedback;
 }
