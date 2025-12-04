@@ -5,6 +5,10 @@ const path = require('path');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const xsenv = require('@sap/xsenv');
+const { performance } = require('perf_hooks');
+
+const { createLogger, MetricsRecorder } = require('./telemetry');
+const { InMemoryRagStore } = require('./rag-store');
 
 const MAX_FILE_SIZE = Number(process.env.DOCUMENT_MAX_SIZE || 10 * 1024 * 1024);
 const ALLOWED_MIME_TYPES = (process.env.ALLOWED_MIME_TYPES || 'application/pdf')
@@ -23,6 +27,10 @@ const ROUTING_HIGH_RISK_LEVELS = (process.env.ROUTING_HIGH_RISK_LEVELS || 'high,
   .split(',')
   .map((risk) => risk.trim().toLowerCase())
   .filter(Boolean);
+
+const metrics = new MetricsRecorder();
+const baseLogger = createLogger({ service: 'document-service' });
+const ragStore = new InMemoryRagStore();
 
 xsenv.loadEnv();
 
@@ -115,8 +123,11 @@ function buildAnalysisPrompt(document) {
     .join('\n');
 }
 
-async function callGenAiAPI(prompt, extractedText) {
-  if (!GENAI_API_URL) {
+async function callGenAiAPI(prompt, extractedText, { logger } = {}) {
+  const apiUrl = process.env.GENAI_API_URL || GENAI_API_URL;
+  const apiKey = process.env.GENAI_API_KEY || GENAI_API_KEY;
+
+  if (!apiUrl) {
     const error = new Error('GENAI_API_URL is not configured');
     error.statusCode = 500;
     throw error;
@@ -132,11 +143,12 @@ async function callGenAiAPI(prompt, extractedText) {
     'Content-Type': 'application/json',
   };
 
-  if (GENAI_API_KEY) {
-    headers.Authorization = `Bearer ${GENAI_API_KEY}`;
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
   }
 
-  const response = await fetch(GENAI_API_URL, {
+  logger?.info('Sending GenAI request', { model: GENAI_MODEL });
+  const response = await fetch(apiUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -151,6 +163,7 @@ async function callGenAiAPI(prompt, extractedText) {
   }
 
   if (!response.ok) {
+    logger?.error('GenAI request failed', { status: response.status });
     const error = new Error(jsonBody.error || 'GenAI request failed');
     error.statusCode = response.status;
     error.details = jsonBody;
@@ -456,6 +469,12 @@ module.exports = cds.service.impl(function () {
   const { Documents, DocumentAnalyses, DocumentFeedback } = this.entities;
   const app = cds.app;
 
+  app.use((req, res, next) => {
+    req.requestId = req.headers['x-request-id'] || cds.utils.uuid();
+    req.logger = baseLogger.child({ requestId: req.requestId });
+    next();
+  });
+
   async function buildDocumentSummary(document) {
     const latestAnalysis = await getAnalysisForDocument(document.ID);
     const routingDecision = latestAnalysis ? evaluateRoutingRules(latestAnalysis) : null;
@@ -476,12 +495,14 @@ module.exports = cds.service.impl(function () {
       const summaries = await Promise.all(documents.map((doc) => buildDocumentSummary(doc)));
       res.json({ items: summaries });
     } catch (error) {
+      (req.logger || baseLogger).error('Failed to load documents', { error: error.message });
       res.status(500).json({ error: error.message || 'Failed to load documents' });
     }
   });
 
   app.get('/documents/:id', async (req, res) => {
     const documentId = req.params.id;
+    const logger = (req.logger || baseLogger).child({ documentId });
     try {
       const document = await SELECT.one.from(Documents).where({ ID: documentId });
       if (!document) {
@@ -491,6 +512,7 @@ module.exports = cds.service.impl(function () {
       const summary = await buildDocumentSummary(document);
       res.json(summary);
     } catch (error) {
+      logger.error('Failed to load document', { error: error.message });
       res.status(500).json({ error: error.message || 'Failed to load document' });
     }
   });
@@ -518,6 +540,7 @@ module.exports = cds.service.impl(function () {
 
       res.json({ items });
     } catch (error) {
+      (req.logger || baseLogger).error('Failed to load workflow statuses', { error: error.message });
       res.status(500).json({ error: error.message || 'Failed to load workflow statuses' });
     }
   });
@@ -528,12 +551,14 @@ module.exports = cds.service.impl(function () {
         return res.status(400).json({ error: err.message });
       }
 
+      const logger = (req.logger || baseLogger).child({ documentId: req.params?.id });
       try {
         const { buffer, fileName, mimeType } = await buildPayload(req);
         validatePayload({ buffer, mimeType });
 
         const extractedText = await extractPdfText(buffer);
         const documentId = cds.utils.uuid();
+        const documentLogger = logger.child({ documentId });
         const storagePath = await persistFile(buffer, documentId, fileName);
 
         const payload = {
@@ -550,10 +575,11 @@ module.exports = cds.service.impl(function () {
 
         const tx = cds.tx({ user: req.user || cds.User.Privileged });
         await tx.run(INSERT.into(Documents).entries(payload));
-
+        documentLogger.info('Document stored', { fileName, mimeType, fileSize: buffer.length });
         res.status(201).json({ id: documentId, text: extractedText });
       } catch (error) {
         const status = error.statusCode || 400;
+        logger.error('Failed to process document', { error: error.message });
         res.status(status).json({ error: error.message || 'Failed to process document' });
       }
     });
@@ -561,6 +587,7 @@ module.exports = cds.service.impl(function () {
 
   app.post('/documents/:id/analyze', async (req, res) => {
     const documentId = req.params.id;
+    const logger = (req.logger || baseLogger).child({ documentId });
 
     try {
       const document = await SELECT.one.from(Documents).where({ ID: documentId });
@@ -573,7 +600,16 @@ module.exports = cds.service.impl(function () {
       }
 
       const prompt = buildAnalysisPrompt(document);
-      const genAiResult = await callGenAiAPI(prompt, document.extractedText);
+      await ragStore.upsertEmbeddings(documentId, [
+        { text: document.extractedText || '', metadata: { title: document.title, fileName: document.fileName } },
+      ]);
+      logger.info('Stored document context in RAG store');
+
+      const aiStart = performance.now();
+      const genAiResult = await callGenAiAPI(prompt, document.extractedText, { logger });
+      const aiLatencyMs = performance.now() - aiStart;
+      metrics.recordAiLatency(aiLatencyMs);
+      logger.info('GenAI analysis complete', { latencyMs: Math.round(aiLatencyMs) });
       const analysis = parseAnalysisResult(genAiResult);
 
       const feedbackRequired =
@@ -605,6 +641,7 @@ module.exports = cds.service.impl(function () {
       });
     } catch (error) {
       const status = error.statusCode || 500;
+      logger.error('Failed to analyze document', { error: error.message });
       res.status(status).json({ error: error.message || 'Failed to analyze document' });
     }
   });
@@ -612,6 +649,7 @@ module.exports = cds.service.impl(function () {
   app.post('/documents/:id/feedback', async (req, res) => {
     const documentId = req.params.id;
     const { analysisId, corrections, comments } = req.body || {};
+    const logger = (req.logger || baseLogger).child({ documentId });
 
     if (!corrections) {
       return res.status(400).json({ error: 'Corrections payload is required' });
@@ -662,6 +700,7 @@ module.exports = cds.service.impl(function () {
       });
     } catch (error) {
       const status = error.statusCode || 500;
+      logger.error('Failed to store feedback', { error: error.message });
       res.status(status).json({ error: error.message || 'Failed to store feedback' });
     }
   });
@@ -669,6 +708,7 @@ module.exports = cds.service.impl(function () {
   app.post('/documents/:id/route', async (req, res) => {
     const documentId = req.params.id;
     const { analysisId } = req.body || {};
+    const logger = (req.logger || baseLogger).child({ documentId });
 
     try {
       const document = await SELECT.one.from(Documents).where({ ID: documentId });
@@ -694,6 +734,13 @@ module.exports = cds.service.impl(function () {
       );
       await tx.run(UPDATE(Documents, documentId).with({ status: 'ROUTED' }));
 
+      metrics.recordWorkflowOutcome('success');
+      logger.info('Workflow triggered', {
+        workflowInstanceId: workflowResult.instanceId,
+        workflowStatus: workflowResult.status,
+        routingDecision: routingDecision.decision,
+      });
+
       res.json({
         documentId,
         analysisId: analysisRecord.ID,
@@ -705,6 +752,19 @@ module.exports = cds.service.impl(function () {
     } catch (error) {
       const status = error.statusCode || 500;
       res.status(status).json({ error: error.message || 'Failed to route document' });
+      metrics.recordWorkflowOutcome('failure');
+      logger.error('Failed to route document', { error: error.message });
     }
   });
 });
+
+module.exports.__internals = {
+  buildAnalysisPrompt,
+  callGenAiAPI,
+  deriveDecisionOutcome,
+  evaluateRoutingRules,
+  parseAnalysisResult,
+  metrics,
+  baseLogger,
+  ragStore,
+};

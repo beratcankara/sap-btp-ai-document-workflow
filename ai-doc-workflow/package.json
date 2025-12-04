@@ -12,11 +12,13 @@
     "pdf-parse": "^1.1.1"
   },
   "devDependencies": {
-    "@cap-js/sqlite": "^2"
+    "@cap-js/sqlite": "^2",
+    "jest": "^29.7.0"
   },
   "scripts": {
     "start": "cds-serve",
-    "watch": "cds watch"
+    "watch": "cds watch",
+    "test": "jest"
   },
   "private": true
 }
