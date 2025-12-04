@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Document Workflow | Upload</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/api.js"></script>
+  </head>
+  <body>
+    <header>
+      <div><strong>AI Document Workflow</strong></div>
+      <nav>
+        <a href="/index.html">Upload</a>
+        <a href="/workflow.html">Workflow Status</a>
+      </nav>
+    </header>
+    <div class="container">
+      <div class="card">
+        <h1>Upload a Document</h1>
+        <p class="muted">Send a PDF to the CAP upload endpoint to extract text and store metadata.</p>
+        <div id="uploadStatus"></div>
+        <form id="uploadForm">
+          <div class="row">
+            <div style="flex: 1 1 260px">
+              <label for="title">Title</label>
+              <input id="title" name="title" type="text" placeholder="Invoice or Contract title" />
+            </div>
+            <div style="flex: 1 1 260px">
+              <label for="description">Description</label>
+              <input id="description" name="description" type="text" placeholder="Short description" />
+            </div>
+          </div>
+          <div class="row">
+            <div style="flex: 1 1 320px">
+              <label for="file">PDF File</label>
+              <input id="file" name="file" type="file" accept="application/pdf" required />
+            </div>
+          </div>
+          <button type="submit">Upload and Extract</button>
+        </form>
+        <div id="uploadResult" style="margin-top: 16px"></div>
+      </div>
+
+      <div class="card">
+        <h2>Recent Documents</h2>
+        <p class="muted">Fetched from the CAP DocumentService using the new helper endpoints.</p>
+        <div id="documentList" class="status-grid"></div>
+      </div>
+    </div>
+
+    <script>
+      const uploadForm = document.getElementById('uploadForm');
+      const uploadStatus = document.getElementById('uploadStatus');
+      const uploadResult = document.getElementById('uploadResult');
+      const documentList = document.getElementById('documentList');
+
+      uploadForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        uploadStatus.innerHTML = '';
+        uploadResult.innerHTML = '';
+
+        const formData = new FormData(uploadForm);
+        const file = formData.get('file');
+        if (!file || file.size === 0) {
+          showError(uploadStatus, 'Please select a PDF file to upload.');
+          return;
+        }
+
+        const submitBtn = uploadForm.querySelector('button[type="submit"]');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Uploading...';
+
+        try {
+          const data = await uploadDocument(formData);
+          showSuccess(uploadStatus, 'Upload successful. Proceed to analysis.');
+          uploadResult.innerHTML = `
+            <div class="stat-card">
+              <div><strong>Document ID</strong></div>
+              <div class="code-block">${data.id}</div>
+              <div style="margin-top: 8px">
+                <a class="link" href="/document.html?id=${data.id}">Open document detail</a>
+              </div>
+            </div>
+          `;
+          await loadDocuments();
+        } catch (error) {
+          showError(uploadStatus, error.message);
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Upload and Extract';
+        }
+      });
+
+      async function loadDocuments() {
+        documentList.innerHTML = '<div class="muted">Loading...</div>';
+        try {
+          const { items } = await fetchDocumentSummaries();
+          if (!items || items.length === 0) {
+            documentList.innerHTML = '<div class="muted">No documents uploaded yet.</div>';
+            return;
+          }
+
+          documentList.innerHTML = items
+            .map(({ document, decisionOutcome }) => {
+              const tone = badgeForOutcome(decisionOutcome?.label);
+              return `
+                <div class="stat-card">
+                  <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px">
+                    <div><strong>${document.title || document.fileName || 'Untitled'}</strong></div>
+                    <span class="label ${tone}">${decisionOutcome?.label || 'Pending'}</span>
+                  </div>
+                  <div class="muted">${document.description || 'No description'}</div>
+                  <div style="margin-top: 8px"><a class="link" href="/document.html?id=${document.ID}">Open detail</a></div>
+                </div>
+              `;
+            })
+            .join('');
+        } catch (error) {
+          showError(documentList, error.message);
+        }
+      }
+
+      loadDocuments();
+    </script>
+  </body>
+</html>

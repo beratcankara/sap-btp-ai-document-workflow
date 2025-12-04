@@ -230,6 +230,30 @@ function evaluateRoutingRules(analysis) {
   };
 }
 
+function deriveDecisionOutcome({ routingDecision, analysis }) {
+  if (!routingDecision && analysis) {
+    routingDecision = evaluateRoutingRules(analysis);
+  }
+
+  if (!routingDecision) {
+    return { label: 'Pending Decision', description: 'No analysis available yet.' };
+  }
+
+  if (routingDecision.decision === 'AUTO_APPROVE') {
+    return { label: 'Auto-Approve', description: routingDecision.reason };
+  }
+
+  if (routingDecision.highRisk) {
+    return { label: 'Reject / Manual Review', description: routingDecision.reason };
+  }
+
+  if (routingDecision.amountExceedsThreshold) {
+    return { label: 'Finance Approval', description: routingDecision.reason };
+  }
+
+  return { label: 'Manager Approval', description: routingDecision.reason };
+}
+
 function buildBpaPayload(document, analysis, routingDecision) {
   return {
     documentId: document.ID,
@@ -431,6 +455,72 @@ async function getAnalysisForDocument(documentId, analysisId) {
 module.exports = cds.service.impl(function () {
   const { Documents, DocumentAnalyses, DocumentFeedback } = this.entities;
   const app = cds.app;
+
+  async function buildDocumentSummary(document) {
+    const latestAnalysis = await getAnalysisForDocument(document.ID);
+    const routingDecision = latestAnalysis ? evaluateRoutingRules(latestAnalysis) : null;
+    const decisionOutcome = deriveDecisionOutcome({ routingDecision, analysis: latestAnalysis });
+
+    return {
+      document,
+      latestAnalysis,
+      decisionOutcome,
+      workflowInstanceId: latestAnalysis?.workflowInstanceId,
+      workflowStatus: latestAnalysis?.workflowStatus,
+    };
+  }
+
+  app.get('/documents', async (req, res) => {
+    try {
+      const documents = await SELECT.from(Documents).orderBy('createdAt desc');
+      const summaries = await Promise.all(documents.map((doc) => buildDocumentSummary(doc)));
+      res.json({ items: summaries });
+    } catch (error) {
+      res.status(500).json({ error: error.message || 'Failed to load documents' });
+    }
+  });
+
+  app.get('/documents/:id', async (req, res) => {
+    const documentId = req.params.id;
+    try {
+      const document = await SELECT.one.from(Documents).where({ ID: documentId });
+      if (!document) {
+        return res.status(404).json({ error: 'Document not found' });
+      }
+
+      const summary = await buildDocumentSummary(document);
+      res.json(summary);
+    } catch (error) {
+      res.status(500).json({ error: error.message || 'Failed to load document' });
+    }
+  });
+
+  app.get('/workflow/status', async (req, res) => {
+    try {
+      const analyses = await SELECT.from(DocumentAnalyses).orderBy('createdAt desc');
+      const docIds = [...new Set(analyses.map((analysis) => analysis.document_ID))];
+      const documents = docIds.length
+        ? await SELECT.from(Documents).where({ ID: { in: docIds } })
+        : [];
+      const documentMap = Object.fromEntries(documents.map((doc) => [doc.ID, doc]));
+
+      const items = analyses.map((analysis) => {
+        const routingDecision = evaluateRoutingRules(analysis);
+        const decisionOutcome = deriveDecisionOutcome({ routingDecision, analysis });
+        return {
+          analysis,
+          document: documentMap[analysis.document_ID],
+          decisionOutcome,
+          workflowInstanceId: analysis.workflowInstanceId,
+          workflowStatus: analysis.workflowStatus,
+        };
+      });
+
+      res.json({ items });
+    } catch (error) {
+      res.status(500).json({ error: error.message || 'Failed to load workflow statuses' });
+    }
+  });
 
   app.post('/documents', (req, res) => {
     upload.single('file')(req, res, async (err) => {
