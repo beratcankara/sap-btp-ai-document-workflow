@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Document Workflow | Status</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/api.js"></script>
+  </head>
+  <body>
+    <header>
+      <div><strong>Workflow Status</strong></div>
+      <nav>
+        <a href="/index.html">Upload</a>
+        <a href="/workflow.html">Workflow Status</a>
+      </nav>
+    </header>
+    <div class="container">
+      <div class="card">
+        <h1>Workflow Instances</h1>
+        <p class="muted">Review routing outcomes returned by the CAP workflow endpoint.</p>
+        <div id="workflowTable"></div>
+      </div>
+    </div>
+
+    <script>
+      const workflowTable = document.getElementById('workflowTable');
+
+      async function loadWorkflow() {
+        workflowTable.innerHTML = '<div class="muted">Loading...</div>';
+        try {
+          const { items } = await fetchWorkflowStatuses();
+          if (!items || items.length === 0) {
+            workflowTable.innerHTML = '<div class="muted">No workflow executions yet.</div>';
+            return;
+          }
+
+          const rows = items
+            .map(({ analysis, document, decisionOutcome }) => {
+              const tone = badgeForOutcome(decisionOutcome?.label);
+              return `
+                <tr>
+                  <td>${document?.title || document?.fileName || 'Untitled'}</td>
+                  <td>${analysis?.workflowInstanceId || '—'}</td>
+                  <td>${analysis?.workflowStatus || 'Pending'}</td>
+                  <td><span class="label ${tone}">${decisionOutcome?.label || 'Pending'}</span></td>
+                  <td>${decisionOutcome?.description || 'Awaiting routing'}</td>
+                  <td><a class="link" href="/document.html?id=${analysis.document_ID}">Open</a></td>
+                </tr>
+              `;
+            })
+            .join('');
+
+          workflowTable.innerHTML = `
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Document</th>
+                  <th>Instance</th>
+                  <th>Status</th>
+                  <th>Decision</th>
+                  <th>Reason</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          `;
+        } catch (error) {
+          showError(workflowTable, error.message);
+        }
+      }
+
+      loadWorkflow();
+    </script>
+  </body>
+</html>

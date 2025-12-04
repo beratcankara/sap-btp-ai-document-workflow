@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Document Workflow | Detail</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/api.js"></script>
+  </head>
+  <body>
+    <header>
+      <div><strong>Document Detail</strong></div>
+      <nav>
+        <a href="/index.html">Upload</a>
+        <a href="/workflow.html">Workflow Status</a>
+      </nav>
+    </header>
+    <div class="container">
+      <div id="banner"></div>
+
+      <div class="card">
+        <h1>Document Overview</h1>
+        <div id="documentMeta" class="status-grid"></div>
+      </div>
+
+      <div class="card">
+        <h2>Analysis</h2>
+        <p class="muted">Trigger GenAI extraction and review the interpreted values.</p>
+        <div class="row" style="align-items: center; gap: 8px">
+          <button id="analyzeBtn">Analyze with GenAI</button>
+          <button id="routeBtn" class="secondary">Route Workflow</button>
+        </div>
+        <div id="analysisResult" style="margin-top: 16px"></div>
+      </div>
+
+      <div class="card">
+        <h2>Feedback</h2>
+        <p class="muted">Send corrections back to the CAP feedback endpoint to retrain and adjust confidence.</p>
+        <div id="feedbackStatus"></div>
+        <form id="feedbackForm">
+          <div class="row">
+            <div style="flex: 1 1 320px">
+              <label for="corrections">Corrections (JSON or plain text)</label>
+              <textarea id="corrections" name="corrections" placeholder='{"amount": 1100.55, "vendor": "ACME"}' required></textarea>
+            </div>
+          </div>
+          <div class="row">
+            <div style="flex: 1 1 320px">
+              <label for="comments">Comments</label>
+              <input id="comments" name="comments" type="text" placeholder="Why is this adjustment needed?" />
+            </div>
+          </div>
+          <button type="submit">Send Feedback</button>
+        </form>
+      </div>
+    </div>
+
+    <script>
+      const banner = document.getElementById('banner');
+      const documentMeta = document.getElementById('documentMeta');
+      const analysisResult = document.getElementById('analysisResult');
+      const feedbackForm = document.getElementById('feedbackForm');
+      const feedbackStatus = document.getElementById('feedbackStatus');
+      const analyzeBtn = document.getElementById('analyzeBtn');
+      const routeBtn = document.getElementById('routeBtn');
+      const documentId = getQueryParam('id');
+      let latestAnalysis = null;
+
+      if (!documentId) {
+        banner.innerHTML = '<div class="alert error">Missing document id. Return to the <a class="link" href="/index.html">upload page</a>.</div>';
+      } else {
+        loadDocument();
+      }
+
+      async function loadDocument() {
+        documentMeta.innerHTML = '<div class="muted">Loading...</div>';
+        analysisResult.innerHTML = '';
+        feedbackStatus.innerHTML = '';
+        try {
+          const detail = await fetchDocumentDetail(documentId);
+          latestAnalysis = detail.latestAnalysis;
+          renderMeta(detail);
+          renderAnalysis(detail);
+        } catch (error) {
+          showError(documentMeta, error.message);
+        }
+      }
+
+      function renderMeta(detail) {
+        const { document, decisionOutcome } = detail;
+        const badgeTone = badgeForOutcome(decisionOutcome?.label);
+        documentMeta.innerHTML = `
+          <div class="stat-card">
+            <div><strong>Title</strong></div>
+            <div>${document.title || document.fileName || 'Untitled'}</div>
+          </div>
+          <div class="stat-card">
+            <div><strong>Description</strong></div>
+            <div>${document.description || 'Not provided'}</div>
+          </div>
+          <div class="stat-card">
+            <div><strong>Status</strong></div>
+            <span class="label info">${document.status}</span>
+          </div>
+          <div class="stat-card">
+            <div><strong>Decision</strong></div>
+            <span class="label ${badgeTone}">${decisionOutcome?.label || 'Pending'}</span>
+            <div class="muted">${decisionOutcome?.description || 'Awaiting workflow routing.'}</div>
+          </div>
+        `;
+      }
+
+      function renderAnalysis(detail) {
+        if (!detail.latestAnalysis) {
+          analysisResult.innerHTML = '<div class="muted">No analysis results yet.</div>';
+          return;
+        }
+        const analysis = detail.latestAnalysis;
+        analysisResult.innerHTML = `
+          <div class="status-grid">
+            <div class="stat-card"><div><strong>Amount</strong></div><div>${analysis.amount ?? '—'}</div></div>
+            <div class="stat-card"><div><strong>Vendor</strong></div><div>${analysis.vendor || '—'}</div></div>
+            <div class="stat-card"><div><strong>Date</strong></div><div>${analysis.date || '—'}</div></div>
+            <div class="stat-card"><div><strong>Risk</strong></div><div>${analysis.riskLevel || '—'}</div></div>
+            <div class="stat-card"><div><strong>Confidence</strong></div><div>${analysis.confidence ?? '—'}</div></div>
+            <div class="stat-card"><div><strong>Feedback Required</strong></div><div>${analysis.feedbackRequired ? 'Yes' : 'No'}</div></div>
+          </div>
+          <div style="margin-top: 12px" class="muted">Workflow Instance: ${detail.workflowInstanceId || '—'} | Status: ${detail.workflowStatus || 'Not started'}</div>
+        `;
+      }
+
+      analyzeBtn.addEventListener('click', async () => {
+        if (!documentId) return;
+        analyzeBtn.disabled = true;
+        analyzeBtn.textContent = 'Analyzing...';
+        try {
+          const data = await analyzeDocument(documentId);
+          latestAnalysis = data;
+          showSuccess(analysisResult, 'Analysis complete. Values updated below.');
+          await loadDocument();
+        } catch (error) {
+          showError(analysisResult, error.message);
+        } finally {
+          analyzeBtn.disabled = false;
+          analyzeBtn.textContent = 'Analyze with GenAI';
+        }
+      });
+
+      routeBtn.addEventListener('click', async () => {
+        if (!documentId) return;
+        if (!latestAnalysis?.analysisId && !latestAnalysis?.ID) {
+          showError(analysisResult, 'Run analysis before routing the workflow.');
+          return;
+        }
+        routeBtn.disabled = true;
+        routeBtn.textContent = 'Routing...';
+        try {
+          const analysisId = latestAnalysis.analysisId || latestAnalysis.ID;
+          const data = await routeDocument(documentId, analysisId);
+          const decision = interpretDecision(data.routingDecision);
+          analysisResult.innerHTML = `
+            <div class="alert success">Workflow routed: ${data.workflowStatus || 'submitted'} (Instance ${data.workflowInstanceId || 'n/a'})</div>
+            <div class="stat-card">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px">
+                <div><strong>Decision</strong></div>
+                <span class="label ${decision.tone}">${decision.label}</span>
+              </div>
+              <div class="muted">${decision.description}</div>
+              <div class="muted" style="margin-top: 8px">Reason: ${data.routingDecision?.reason || 'N/A'}</div>
+            </div>
+          `;
+        } catch (error) {
+          showError(analysisResult, error.message);
+        } finally {
+          routeBtn.disabled = false;
+          routeBtn.textContent = 'Route Workflow';
+        }
+      });
+
+      feedbackForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (!documentId) return;
+        const corrections = document.getElementById('corrections').value;
+        const comments = document.getElementById('comments').value;
+
+        const payload = { corrections, comments };
+        if (latestAnalysis?.analysisId || latestAnalysis?.ID) {
+          payload.analysisId = latestAnalysis.analysisId || latestAnalysis.ID;
+        }
+
+        const submitBtn = feedbackForm.querySelector('button[type="submit"]');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Sending...';
+
+        try {
+          await sendFeedback(documentId, payload);
+          showSuccess(feedbackStatus, 'Feedback recorded.');
+          await loadDocument();
+        } catch (error) {
+          showError(feedbackStatus, error.message);
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Send Feedback';
+        }
+      });
+    </script>
+  </body>
+</html>
