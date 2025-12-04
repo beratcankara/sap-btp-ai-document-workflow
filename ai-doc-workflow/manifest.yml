@@ -1,0 +1,17 @@
+applications:
+  - name: ai-doc-workflow
+    path: .
+    random-route: true
+    buildpacks:
+      - nodejs_buildpack
+    command: npm start
+    memory: 256M
+    env:
+      NODE_ENV: production
+      destinations: '[{"name":"sap-mock","url":"https://sandbox.api.sap.com/mock","authentication":"NoAuthentication","proxyType":"Internet"}]'
+    services:
+      - ai-doc-workflow-uaa
+      - ai-doc-workflow-destination
+    metadata:
+      annotations:
+        xs-security: xs-security.json

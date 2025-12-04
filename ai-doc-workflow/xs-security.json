@@ -1,0 +1,34 @@
+{
+  "xsappname": "ai-doc-workflow-${space}",
+  "tenant-mode": "dedicated",
+  "description": "Security profile for AI Document Workflow",
+  "scopes": [
+    {
+      "name": "$XSAPPNAME.Viewer",
+      "description": "View documents"
+    },
+    {
+      "name": "$XSAPPNAME.Uploader",
+      "description": "Create and manage documents"
+    }
+  ],
+  "role-templates": [
+    {
+      "name": "Viewer",
+      "description": "Read-only access to documents",
+      "scope-references": ["$XSAPPNAME.Viewer"]
+    },
+    {
+      "name": "Uploader",
+      "description": "Create and update documents",
+      "scope-references": ["$XSAPPNAME.Viewer", "$XSAPPNAME.Uploader"]
+    }
+  ],
+  "authorities": [],
+  "oauth2-configuration": {
+    "redirect-uris": [
+      "https://*.cfapps.*.hana.ondemand.com/**",
+      "http://localhost/**"
+    ]
+  }
+}
