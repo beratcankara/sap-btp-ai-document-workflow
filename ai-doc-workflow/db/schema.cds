@@ -24,6 +24,8 @@ entity DocumentAnalyses : cuid, managed {
   confidence       : Decimal(5, 2);
   feedbackRequired : Boolean default false;
   feedbackProvided : Boolean default false;
+  workflowInstanceId : String(255);
+  workflowStatus     : String(60);
 }
 
 entity DocumentFeedback : cuid, managed {
